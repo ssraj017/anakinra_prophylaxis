@@ -1,0 +1,2151 @@
+---
+title: "Interleukin-1 Inhibition with Anakinra In CD19 CAR T Therapy for Lymphoma"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+#### Code: Environment
+```{r}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=T)
+
+```
+
+```{r}
+library(tidyverse)
+library(conflicted)
+library(ggplot2)
+library(dplyr)
+library(here)
+library(showtext)
+library(cmprsk)
+library(gtsummary)
+library(broom)
+library(MatchIt)
+library(survival)
+library(ggsurvfit)
+library(ggsci)
+library(cobalt)
+conflict_prefer_all(winner="dplyr", quiet = TRUE)
+font_add("Arial", '/System/Library/Fonts/Supplemental/Arial.ttf')
+showtext_auto()
+theme_set(theme_minimal(base_family = "Arial"))
+```
+
+#### Code: Load Data
+```{r}
+rm(list=ls())
+
+load(here('data/cleaned_data', 'clean_data_2026_11_13.RData'))
+source(here('scripts', 'functions.R'))
+figures_dir = "figures/round3"
+```
+
+## Supplementary Fig 3: Propensity Matching Quality
+Love plot shows standardized mean differences (SMD) of baseline covariates before (unmatched) and after (matched) propensity score matching between patients treated with anakinra prophylaxis on study and real-world control patients treated without anakinra prophylaxis.
+
+```{r suppfig1}
+# Define severe ICAHT
+main_df <- main_df %>%
+  mutate(
+    icaht34=case_when(
+      is.na(max_icaht)~NA,
+      as.numeric(max_icaht)>=3~TRUE,
+      .default = FALSE
+    )
+  )
+
+# Include only MSK patients for matching analysis
+df_nomissing <- main_df  %>% filter(grepl("msk", record_id)) 
+
+# Matching variables include age, KPS stratified as >= 90 vs < 90, costimulatory domain, lymphoma subtype (FL, LBCL, MCL), disease response at infusion, and elevated LDH. 
+set.seed(1)
+match_obj <- matchit(cohort_2lvl ~ age + kps_2lvl + costim + dx_heme + ds_res_infusion + bin_preld_ldh, 
+                     data = df_nomissing,
+                     method = "optimal",
+                     distance = "logit", 
+                     ratio=1
+                     )
+
+
+matched_data <- match.data(match_obj)
+cohort1 <- (matched_data %>% filter(akra_cohort=="cohort 1"))$subclass
+cohort2 <- (matched_data %>% filter(akra_cohort=="cohort 2"))$subclass
+
+m1 <- matched_data %>%
+  mutate(akra_cohort=case_when(
+    subclass %in% cohort1 & akra_cohort=="cohort 1"~"cohort1",
+    subclass %in% cohort1 & akra_cohort=="no anakinra"~"cohort1 control",
+    subclass %in% cohort2 & akra_cohort=="cohort 2"~"cohort2",
+    subclass %in% cohort2 & akra_cohort=="no anakinra"~"cohort2 control"
+  )) %>%
+  mutate(akra_cohort=factor(akra_cohort, levels=c("cohort1 control","cohort1", "cohort2 control", "cohort2")))
+
+# Love plot shows 
+sp1 <- love.plot(match_obj,
+  stats = "mean.diffs",       
+  abs = T,                 
+  var.order = "unadjusted",   
+  threshold = 0.1,
+  colors = c("red", "blue"),  # unadjusted vs adjusted
+  shapes = c(17, 16)
+)
+# SMD for distance = 0.12
+(sp1@data %>% filter(Sample=="Adjusted") %>% filter(var=="distance"))$stat
+
+print(sp1)
+ggsave(here('figures/round3', 'suppfig3.pdf'), plot = sp1)
+```
+
+## Figure S1 - Blood plasma specimen collection across cohorts for cytokine profiling.
+
+```{r fig1d, fig.width=10, fig.height=7, dpi=150}
+figs1 <- c1_luminex %>% filter(source=='plasma') %>% 
+  mutate(day_rel_car=ifelse(day_rel_car < 0, 'Screen', as.character(day_rel_car))) %>% 
+  mutate(cohort="cohort 1") %>%
+  select(record_id, cohort, day_rel_car) %>% 
+  bind_rows(
+    c2_luminex %>% 
+      filter(cytokine=='egf') %>% # EGF was measured successfully in every luminex assay run for cohort 2
+      filter(source=='plasma') %>% 
+      filter(day_rel_car >= -21 & day_rel_car < 45) %>% 
+      mutate(day_rel_car=ifelse(day_rel_car < 0, 'Screen', as.character(day_rel_car))) %>% 
+      mutate(cohort="cohort 2") %>% select(record_id, cohort, day_rel_car),
+    match_olink %>% select(record_id, day_rel_car) %>%
+      filter(day_rel_car >= -21 & day_rel_car < 45) %>% 
+      mutate(day_rel_car=ifelse(day_rel_car < 0, 'Screen', as.character(day_rel_car))) %>% 
+      left_join(df_nomissing %>% select(record_id, cohort=akra_cohort)) 
+  ) %>% 
+  distinct() %>%
+  mutate(day_rel_car=factor(day_rel_car, levels=c('Screen', as.character(0:45)))) %>% 
+  group_by(cohort, day_rel_car) %>% reframe(freq=n()) %>% ungroup() %>% 
+  ggplot(aes(x=day_rel_car, y=freq, fill=cohort)) +
+  xlab('') + ylab('')+
+  scale_fill_manual(values = c("cohort 1" = "#1F5AA6", "cohort 2" = "#087F8C", "no anakinra" = 'darkred'))+
+  theme_classic() + 
+  facet_grid(cohort~.) + 
+  theme(text = element_text(family = "Arial", size=20),
+        axis.text.x = element_text(angle=0),
+        legend.position='none') + 
+  geom_bar(stat='identity', color='black', alpha=0.7)
+
+print(figs1)
+ggsave(here('figures/round3', 'figs1.pdf'), plot = figs1, width = 10, height=7)
+
+```
+
+## Table 1 Stratified by Cohort
+```{r Table 1}
+tbl1 <- main_df %>%
+  select(!akra_cohort) %>% 
+  left_join(m1 %>% select(record_id, akra_cohort)) %>% 
+  mutate(akra_cohort=ifelse(is.na(akra_cohort), "Non-matched", as.character(akra_cohort))) %>%
+  mutate(akra_cohort=ifelse(grepl('hmh', record_id), "cohort2", as.character(akra_cohort))) %>%
+  mutate(akra_cohort=factor(akra_cohort, levels=c("cohort1 control","cohort1", "cohort2 control", "cohort2", 'Non-matched'))) %>% 
+  transmute(
+    Age = age,
+    `Female Sex` = case_when(
+      is.na(sex)~NA,
+      sex=='female'~1,
+      .default=0
+    ),
+    
+    Race = race,
+    Ethnicity=ethnicity,
+    
+    `Karnofsky Performance Status < 90` = 
+      case_when(
+      is.na(kps_2lvl)~NA,
+      kps_2lvl=='<90'~1,
+      .default=0
+    ),
+    `BMI` = as.numeric(trimws(bmi)),
+    `Diagnosis` = 
+      case_when(
+        dx_heme=="large b-cell lymphoma" & lbcl_subtype=="dlbcl nos"~"Diffuse Large B-cell Lymphoma NOS",
+        dx_heme=="large b-cell lymphoma" & lbcl_subtype=="high-grade b-cell ly."~"High-Grade B-cell Lymphoma",
+        dx_heme=="large b-cell lymphoma" & lbcl_subtype=="other lbcl"~"Other LBCL",
+        dx_heme=="mantle cell lymphoma"~"Mantle Cell Lymphoma",
+        dx_heme=="follicular lymphoma"~"Follicular Lymphoma"
+      ),
+    `Transformed Disease` = 
+      case_when(
+        lbcl_trans_dr=="de-novo lbcl"~ "De-novo LBCL",
+        lbcl_trans_dr=="transformed lbcl"~ "Transformed LBCL",
+        lbcl_trans_dr=="Not applicable"~ "Not LBCL"
+      ),
+    `Bulky (>10cm) Disease at Apheresis` = bulky10cm_aph,
+    `History of CNS Disease` = cns_hx,
+    `Active CNS Disease at Infusion` = active_cns,
+    `Number of Treatment Lines before CAR-T` = num_lines_precar,
+    `Prior AutoSCT` = auto_hx,
+    `Refractory to Treatment Line before Apheresis` = ref_aph,
+    `Primary Refractory Disease` = 
+      case_when(
+      is.na(primary_ref)~NA,
+      primary_ref=='yes'~1,
+      .default=0
+    ),
+    `Underwent Bridging Therapy` = bridge,
+    `IPI at Apheresis` = case_when(
+      ipi_aph %in% c('0', '1') ~ 'Low 0-1',
+      ipi_aph %in% c('2', '3') ~ 'Intermediate 2-3',
+      ipi_aph %in% c('4', '5') ~ 'High 4-5'
+      ),
+     SPD = as.numeric(spd),
+    `Pre-LD Elevated LDH` = bin_preld_ldh,
+    `Disease Status at Infusion` = case_when(
+      ds_res_infusion %in% c("cr") ~ "CR",
+      ds_res_infusion %in% c("pr") ~ "PR",
+      ds_res_infusion %in% c("sd","pod") ~ "SD/POD",
+      ds_res_infusion %in% c("unevaluable") ~ "Unevaluable"
+      ),
+    `Pre-infusion CRP` = d0_crp_raw,
+    `CAR-T Product` = str_to_sentence(car_t_product),
+     akra_cohort = factor(case_when(
+      akra_cohort == 'cohort1' ~ 'Cohort 1',
+      akra_cohort == 'cohort1 control' ~ 'Cohort 1\nControl',
+      akra_cohort == 'cohort2' ~ 'Cohort 2',
+      akra_cohort == 'cohort2 control' ~ 'Cohort 2\nControl',
+      akra_cohort == 'Non-matched' ~ 'Unmatched'
+    ), levels = c(
+      'Cohort 1',
+      'Cohort 1\nControl',
+      'Cohort 2',
+      'Cohort 2\nControl',
+      'Unmatched'
+    )
+    )
+  ) %>% 
+  tbl_summary(by="akra_cohort")
+
+tbl1
+
+tbl1 %>%
+  as_flex_table() %>%
+  flextable::save_as_docx(path = here("figures/round3", "table1.docx"))
+```
+
+# Toxicity Analysis
+
+## Figure 2A - Rates of immuno- and hematotoxicity
+
+```{r, fig.width=14, fig.height=5, dpi=150}
+common_clean <- main_df %>%
+  select(!akra_cohort) %>% 
+  left_join(m1 %>% select(record_id, subclass, akra_cohort)) %>% 
+  mutate(akra_cohort=ifelse(grepl('hmh', record_id), "cohort2", as.character(akra_cohort))) %>%
+  transmute(
+    record_id,
+    `ICANS > 2` = case_when(
+      is.na(icans34)~NA,
+      icans34==T~1,
+      .default=0
+    ),
+    `ICANS > 1` = case_when(
+      is.na(icans24)~NA,
+      icans24==T~1,
+      .default=0
+    ),
+    `ICANS Duration (Days)` = as.numeric(dur_icans),
+    `CRS > 2` = case_when(
+      is.na(crs34)~NA,
+      crs34==T~1,
+      .default=0
+    ),
+    `CRS Duration (Days)` = as.numeric(dur_crs),
+    `ICU Admission` = case_when(
+      is.na(tox_icu)~NA,
+      tox_icu=='yes'~1,
+      .default=0
+    ),
+    `Blood Stream Infection` = case_when(
+      is.na(tox_bsi)~NA,
+      tox_bsi=='yes'~1,
+      .default=0
+    ),
+    `CR by 1 Year` = case_when(
+      is.na(everCR_365)~NA,
+      everCR_365==T~1,
+      .default=0
+    ),
+    `ICAHT > 2` = icaht34,
+    `Treated with Tocilizumab` = case_when(
+      is.na(toci_trt)~NA,
+      toci_trt=='yes'~1,
+      .default=0
+    ),
+    `Treated with Steroids` = case_when(
+      is.na(steroids_trt)~NA,
+      steroids_trt=='yes'~1,
+      .default=0
+    ),
+    maxcrs,
+    maxicans,
+    max_icaht,
+    tt_pfs_m,
+    ev_pfs,
+    tt_os_m,
+    ev_os,
+    ev_rel,
+    subclass,
+    akra_cohort,
+    cohort_2lvl
+  )
+
+fig2a <- common_clean %>% 
+  filter(akra_cohort %in% c('cohort1', "cohort2")) %>% 
+  select(record_id,maxcrs, maxicans, max_icaht, akra_cohort) %>% 
+  mutate_all(factor) %>%
+  pivot_longer(!c(record_id, akra_cohort), names_to = 'outcomes', values_to = 'grade') %>%
+  group_by(akra_cohort, outcomes, grade) %>% reframe(freq=n()) %>% ungroup() %>%
+  mutate(outcomes=factor(outcomes, levels=c("maxicans", 'maxcrs', 'max_icaht'))) %>%
+  mutate(grade = factor(grade, levels=c(NA, '5', '4', '3', '2', '1', '0'))) %>%
+  ggplot(aes(x=interaction(akra_cohort, outcomes), y=freq, fill=grade)) + 
+  xlab('') + ylab('') + 
+  geom_col() + 
+  theme_classic() +
+  geom_text(aes(label=freq), size=6, hjust=0.5, vjust=3, position='stack') + 
+  theme(text = element_text(family = "Arial"),
+        axis.title = element_text(size=18),
+        axis.text = element_text(size=16),
+        legend.position='none') + 
+  scale_fill_npg()
+
+print(fig2a)
+ggsave(here(figures_dir, "fig2a.pdf"), plot=fig2a, width = 14, height=5, dpi = 150)
+```
+
+## Table S2 Rates of each grade of CRS and ICANS and their associated 95% CI (Secondary endpoints)
+```{r}
+propci <- function(cohort, variable, outcome) {
+  temp <- binom.test(x=sum((common_clean$akra_cohort==paste0("cohort", cohort) & common_clean[variable]==outcome), na.rm=T), n=sum(common_clean$akra_cohort==paste0("cohort", cohort), na.rm=T), conf.level = 0.95)
+  paste0("Cohort ", cohort, ", ", variable, "=", outcome, ": ", round(temp$estimate, 2), " 95% CI (", round(temp$conf.int[1], 2), " - ", round(temp$conf.int[2], 2), ")")
+}
+
+secondary_otcm <- as.data.frame(c(
+  propci(1, 'CRS > 2', 1),
+propci(2, 'CRS > 2', 1),
+propci(1, 'maxcrs', 1),
+propci(1, 'maxcrs', 2),
+propci(1, 'maxcrs', 3),
+propci(1, 'maxcrs', 4),
+propci(2, 'maxcrs', 1),
+propci(2, 'maxcrs', 2),
+propci(2, 'maxcrs', 3),
+propci(2, 'maxcrs', 4),
+
+propci(1, 'maxicans', 1),
+propci(1, 'maxicans', 2),
+propci(1, 'maxicans', 3),
+propci(1, 'maxicans', 4),
+propci(2, 'maxicans', 1),
+propci(2, 'maxicans', 2),
+propci(2, 'maxicans', 3),
+propci(2, 'maxicans', 4),
+
+propci(1, 'Treated with Tocilizumab', 1),
+propci(2, 'Treated with Tocilizumab', 1),
+
+propci(1, 'Treated with Steroids', 1),
+propci(2, 'Treated with Steroids', 1)
+))
+
+propci(1, 'ICANS > 2', 1)
+propci(2, 'ICANS > 2', 1)
+
+binom.test(x=sum((common_clean$akra_cohort %in% c("cohort1", "cohort2") & common_clean['ICANS > 2']==1), na.rm=T), n=sum(common_clean$akra_cohort %in% c("cohort1", "cohort2"), na.rm=T), conf.level = 0.95)
+
+
+secondary_otcm
+
+
+```
+
+```{r}
+# Get max grade infectious event per patient within 1 year of CAR-T cell infusion.
+infect <- infectious_ctcae %>% 
+  filter(is.na(day_rel_car) | day_rel_car >=0) %>% 
+  filter(is.na(day_rel_car) | day_rel_car < 365.25) %>% 
+  group_by(record_id) %>% slice(which.max(inf_ctcae)) %>% ungroup() %>%
+  select(record_id, inf_ctcae) %>%
+  mutate(`Infection > 1` = ifelse(inf_ctcae>=2, 1, 0)) %>%
+  mutate(`Infection > 2` = ifelse(inf_ctcae>=3, 1, 0)) 
+
+common_clean <- common_clean %>% left_join(infect)
+
+
+```
+
+## Figure 2B 
+```{r}
+ccpsm <- common_clean %>%
+  filter(!is.na(akra_cohort)) %>% 
+  filter(!grepl('hmh', record_id))
+
+ccc2 <- common_clean %>%
+  filter(akra_cohort %in% c('cohort1', 'cohort2'))
+
+binary_outcomes <- c(
+  'ICANS > 2',
+  'ICANS > 1',
+  'CRS > 2',
+  'ICAHT > 2',
+  'Treated with Tocilizumab', 
+  'Treated with Steroids',
+  'ICU Admission',
+  'Blood Stream Infection',
+  'Infection > 2'
+)
+
+continuous_outcomes <- c(
+  'ICANS Duration (Days)',
+  'CRS Duration (Days)'
+)
+
+surv_outcomes <- tribble(
+  ~outcome, ~time,       ~event,
+  "OS",     "tt_os_m",   "ev_os"
+)
+
+inc_outcomes <- tribble(
+  ~outcome, ~time,       ~status, ~failcode,
+  "NRM",    "tt_pfs_m",  "ev_rel", 2
+)
+
+cohort_var <- 'cohort_2lvl'
+cohort_levels <- levels(factor(common_clean[[cohort_var]]))
+
+binary_tbl <-
+  map_dfr(binary_outcomes, function(outcome) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Binary",
+      psmcontrol_summary = fmt_binary(ccpsm, outcome, cohort_levels[1], cohort_var),
+      psmtx_summary = fmt_binary(ccpsm, outcome, cohort_levels[2], cohort_var),
+      
+      effect = fmt_or(ccpsm, outcome, cohort_var),
+      pval = fmt_or_pval(ccpsm, outcome, cohort_var)
+      
+    )
+  })
+
+cont_tbl <-
+  map_dfr(continuous_outcomes, function(outcome) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Continuous",
+      psmcontrol_summary = fmt_continuous(ccpsm, outcome, cohort_levels[1], cohort_var),
+            psmtx_summary = fmt_continuous(ccpsm, outcome, cohort_levels[2], cohort_var),
+      
+      effect = NA,
+      pval = fmt_wilcox(data=ccpsm, outcome=outcome, cohort_levels=cohort_levels, cohort_var=cohort_var)
+    )
+  })
+
+surv_tbl <-
+  pmap_dfr(surv_outcomes, function(outcome, time, event) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Time-to-event",
+      psmcontrol_summary = fmt_median_surv(ccpsm, time, event, cohort_levels[1], cohort_var),
+            psmtx_summary = fmt_median_surv(ccpsm, time, event, cohort_levels[2], cohort_var),
+      
+      effect = fmt_hr(ccpsm, time, event, cohort_var),
+      pval = fmt_hr_pval(ccpsm, time, event, cohort_var)
+    )
+  })
+
+inc_tbl <-
+  pmap_dfr(inc_outcomes, function(outcome, time, status, failcode) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Cumulative Incidence at 12 months",
+      psmcontrol_summary = calc_cif_at_time(data = ccpsm,time=time,status=status,failcode=failcode,cohort_level=cohort_levels[1],cohort_var=cohort_var),
+      psmtx_summary = calc_cif_at_time(data = ccpsm,time=time,status=status,failcode=failcode,cohort_level=cohort_levels[2],cohort_var=cohort_var),
+      
+      effect = fmt_cihr(data=ccpsm, time=time, event=status, cohort_var=cohort_var, etype=as.character(failcode)),
+      pval = fmt_cihr_pval(data=ccpsm, time=time, event=status, cohort_var=cohort_var, etype=as.character(failcode))
+    )
+  })
+
+library(gt)
+
+final_outcome_tbl <-
+  bind_rows(binary_tbl, surv_tbl, inc_tbl) %>% 
+  gt(groupname_col = "outcome_type") |>
+  cols_label(
+    outcome = md("**Outcome**"),
+    psmcontrol_summary = md(paste0("**", cohort_levels[1], "**")),
+    psmtx_summary = md(paste0("**", cohort_levels[2], "**")),
+    effect = md("**OR/HR (95% CI)**"),
+    pval = md("**p value**")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(psmcontrol_summary,psmtx_summary, effect)
+  )
+
+final_outcome_tbl
+
+final_outcome_tbl %>%
+  gtsave(here(figures_dir, "fig2b.docx"))
+
+```
+
+## Figure S9 - Anakinra dose escalations
+```{r, fig.width=8, fig.height=12, dpi=150}
+
+# Row labels per study patient. 
+m1_key <- m1 %>% filter(cohort_2lvl=="anakinra") %>% 
+  transmute(trial_subclass=case_when(
+    is.na(pinf_akra_dose_ind)~ paste0(trial_id, ", No dose escalation"),
+    !is.na(pinf_akra_dose_ind)~ paste0(trial_id, ", ", pinf_akra_dose_ind)
+    ), trial_id, subclass) %>%
+  mutate(trial_id_no=as.numeric(gsub(".+ID(.+)", "\\1", trial_id))) %>% select(!trial_id)
+
+roi_meta <- m1 %>% select(record_id, trial_id, akra_cohort, cohort_2lvl, subclass, weight, dose_ind=pinf_akra_dose_ind) %>% 
+  mutate(dose_ind=ifelse(is.na(dose_ind), "No dose escalation", dose_ind)) %>%
+  left_join(m1_key, by="subclass") %>% 
+  arrange(akra_cohort, trial_id_no) %>%
+  mutate(trial_subclass = factor(trial_subclass, levels = rev(unique(trial_subclass[order(akra_cohort)]))))
+
+ad_akra <- data.frame(record_id=rep(roi_meta$record_id, each=29), day_rel_car=rep(seq(from=0, to=28, by=1), times=length(roi_meta$record_id))) %>%
+  left_join(roi_meta)  %>%
+  left_join(akra_doses) %>%
+  mutate(numdose=ifelse(is.na(daily_dose), "0", daily_dose)) %>%
+  mutate(numdose=as.character(numdose)) %>%
+  mutate(cohort_2lvl=factor(cohort_2lvl, levels=c("anakinra", "control")))
+
+ad_paired <- 
+  ad_akra %>% 
+  mutate(cohort_3lvl=case_when(
+    grepl("control", akra_cohort)~"Control",
+    .default=akra_cohort
+  )) %>% 
+  arrange(record_id, day_rel_car) %>%
+  transmute(cohort_2lvl, akra_cohort, subclass, record_id, day_rel_car, numdose=as.numeric(numdose)) %>%
+  mutate(akra_cohort=ifelse(grepl("1", akra_cohort), "cohort1", "cohort2")) %>% 
+  group_by(cohort_2lvl, akra_cohort, subclass, record_id) %>% reframe(total_dose=(sum(numdose))) %>% ungroup() %>%
+  select(!record_id) %>% pivot_wider(names_from = "cohort_2lvl", values_from = "total_dose") 
+
+# Descriptive statistics for total anakinra dose expososure by cohort. 
+akra_quant <- quantile( (ad_paired)$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+akra_quant_c1 <- quantile( (ad_paired %>% filter(akra_cohort=="cohort1"))$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+akra_quant_c2 <- quantile( (ad_paired %>% filter(akra_cohort=="cohort2"))$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+
+# Each row represents a study patient (left) and their matched pair (right)
+ad1 <- ad_akra %>% 
+  ggplot(aes(x=day_rel_car, y=trial_subclass, fill=numdose)) + 
+  facet_wrap(.~cohort_2lvl) + 
+  geom_tile(color = "black", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c("0" = "white",
+               "100" = "#c6dbef",
+               "200" = "#6baed6",
+               "300" = "#2171b5",
+               "400" = "#08519c",
+               "500" = "#08306b"),
+    name = "Dose (mg)"
+  ) +
+  theme_classic() + 
+  theme(legend.position="bottom") + 
+  xlab("Days from CAR-T Infusion")
+
+ad1
+
+ggsave(here(figures_dir, "figs9.pdf"), plot=ad1, width = 8, height=12, dpi = 150)
+```
+
+## Figure S6 - IL6-blocking Agent Administrations
+```{r, fig.width=8, fig.height=12, dpi=150}
+m1_key <- m1 %>% filter(cohort_2lvl=="anakinra") %>% 
+  transmute(trial_subclass=case_when(
+    is.na(pinf_toci_ind)~ paste0(trial_id, ", No IL6 blockade"),
+    !is.na(pinf_toci_ind)~ paste0(trial_id, ", ", pinf_toci_ind)
+    ), trial_id, subclass) %>%
+  mutate(trial_id_no=as.numeric(gsub(".+ID(.+)", "\\1", trial_id))) %>% select(!trial_id)
+
+roi_meta <- m1 %>% select(record_id, trial_id, akra_cohort, cohort_2lvl, subclass, weight, dose_ind=pinf_toci_ind) %>% 
+  mutate(dose_ind=ifelse(is.na(dose_ind), "No IL6 blockade", dose_ind)) %>%
+  left_join(m1_key, by="subclass") %>% 
+  arrange(akra_cohort, trial_id_no) %>%
+  mutate(trial_subclass = factor(trial_subclass, levels = rev(unique(trial_subclass[order(akra_cohort)]))))
+
+ad_toci <- data.frame(record_id=rep(roi_meta$record_id, each=29), day_rel_car=rep(seq(from=0, to=28, by=1), times=length(roi_meta$record_id))) %>%
+  left_join(roi_meta)  %>%
+  left_join(il6_doses) %>%
+  mutate(numdose=ifelse(is.na(numdose), "0", numdose)) %>%
+  mutate(numdose=as.character(numdose)) %>%
+  mutate(cohort_2lvl=factor(cohort_2lvl, levels=c("anakinra", "control")))
+
+ad_paired <- 
+  ad_toci %>% 
+  mutate(cohort_3lvl=case_when(
+    grepl("control", akra_cohort)~"Control",
+    .default=akra_cohort
+  )) %>% 
+  arrange(record_id, day_rel_car) %>%
+  transmute(cohort_2lvl, akra_cohort, subclass, record_id, day_rel_car, numdose=as.numeric(numdose)) %>%
+  mutate(akra_cohort=ifelse(grepl("1", akra_cohort), "cohort1", "cohort2")) %>% 
+  group_by(cohort_2lvl, akra_cohort, subclass, record_id) %>% reframe(total_dose=(sum(numdose))) %>% ungroup() %>%
+  select(!record_id) %>% pivot_wider(names_from = "cohort_2lvl", values_from = "total_dose") 
+
+# Comparison between study and PSM cohort for total number of IL6B doses administered
+toci_ttest <- t.test(ad_paired$anakinra, ad_paired$control, paired = T)
+
+# Descriptive statistics
+toci_quant_akra <- quantile( (ad_paired)$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+toci_quant_control <- quantile( (ad_paired)$control, probs=c(0.25, 0.5, 0.75) ) 
+
+toci_quant_c1 <- quantile( (ad_paired %>% filter(akra_cohort=="cohort1"))$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+toci_quant_c2 <- quantile( (ad_paired %>% filter(akra_cohort=="cohort2"))$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+
+# How many more doses of IL6B did each study patient receive over their matched pair
+ad_paired1 <- ad_paired %>% mutate(ddiff = anakinra-control) %>%
+  select(!c(anakinra, control)) %>% 
+  pivot_wider(names_from = "akra_cohort", values_from = "ddiff")
+toci_quant_c1_diff <- quantile( (ad_paired1 %>% drop_na(cohort1))$cohort1, probs=c(0.25, 0.5, 0.75) ) 
+toci_quant_c2_diff <- quantile( (ad_paired1 %>% drop_na(cohort2))$cohort2, probs=c(0.25, 0.5, 0.75) ) 
+
+ad_cum <- ad_toci%>% 
+  mutate(cohort_3lvl=case_when(
+    grepl("control", akra_cohort)~"Control",
+    .default=akra_cohort
+  )) %>% 
+  filter(!grepl("control", akra_cohort)) %>% 
+  arrange(record_id, day_rel_car) %>%
+  transmute(cohort_3lvl, record_id, day_rel_car, numdose=as.numeric(numdose))  %>%
+  group_by(record_id) %>% 
+  mutate(cumdose=cumsum(numdose)) %>% ungroup() %>%
+  group_by(cohort_3lvl, day_rel_car) %>% reframe(med_dose=mean(cumdose),
+                                              low_conf=quantile(cumdose, probs=c(0.25)[1]),
+                                              high_conf=quantile(cumdose, probs=c(0.75)[1])
+                                              ) %>% ungroup() %>%
+  ggplot(aes(x=day_rel_car, y=med_dose, color=cohort_3lvl, fill=cohort_3lvl)) + 
+  #geom_ribbon(aes(ymin = low_conf, ymax = high_conf), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point() 
+  
+ad_cum
+
+ad1 <- ad_toci %>%
+  ggplot(aes(x=day_rel_car, y=trial_subclass, fill=numdose)) + 
+  facet_wrap(.~cohort_2lvl) + 
+  geom_tile(color = "black", linewidth = 0.3) +
+
+  scale_fill_manual(
+    values = c("0" = "white",
+               "1" = "#6baed6",
+               "2" = "#2171b5",
+               "3" = "#08519c",
+               "3" = "#08519f",
+               "5" = "#08306b"),
+    name = "Number of Doses"
+  ) +
+  #scale_fill_gradient(low = "white", high = "#08306b") +
+
+  theme_classic() + 
+  theme(legend.position="bottom")
+
+ad1
+
+ggsave(here(figures_dir, "figs6.pdf"), plot=ad1, width = 8, height=12, dpi = 150)
+```
+
+## Figure S7 - Systemic Steroid Administrations
+
+```{r, fig.width=8, fig.height=12, dpi=150}
+m1_key <- m1 %>% filter(cohort_2lvl=="anakinra") %>% 
+  transmute(trial_subclass=case_when(
+    is.na(pinf_steroid_ind)~ paste0(trial_id, ", No steroids"),
+    !is.na(pinf_steroid_ind)~ paste0(trial_id, ", ", pinf_steroid_ind)
+    ), trial_id, subclass) %>%
+  mutate(trial_id_no=as.numeric(gsub(".+ID(.+)", "\\1", trial_id))) %>% select(!trial_id)
+
+roi_meta <- m1 %>% select(record_id, trial_id, akra_cohort, cohort_2lvl, subclass, weight, dose_ind=pinf_steroid_ind) %>% 
+  mutate(dose_ind=ifelse(is.na(dose_ind), "No steroids", dose_ind)) %>%
+  left_join(m1_key, by="subclass") %>% 
+  arrange(akra_cohort, trial_id_no) %>%
+  mutate(trial_subclass = factor(trial_subclass, levels = rev(unique(trial_subclass[order(akra_cohort)]))))
+
+ad_ster <- data.frame(record_id=rep(roi_meta$record_id, each=29), day_rel_car=rep(seq(from=0, to=28, by=1), times=length(roi_meta$record_id))) %>%
+  left_join(roi_meta)  %>%
+  left_join(steroid_doses) %>%
+  mutate(dose_equiv=ifelse(is.na(dose_equiv), 0, dose_equiv)) %>%
+  mutate(dose_equiv=dose_equiv/as.numeric(weight)) %>% 
+  mutate(cohort_2lvl=factor(cohort_2lvl, levels=c("anakinra", "control"))) %>%
+  mutate(
+    dose_equiv_bin=case_when(
+      dose_equiv == 0 ~ "0",
+      dose_equiv > 0 & dose_equiv <= 5 ~ "0-5",
+      dose_equiv > 5 & dose_equiv <= 10 ~ "5-10",
+      dose_equiv > 10 & dose_equiv <= 15 ~ "10-15",
+      dose_equiv > 15  ~ ">15"
+    )
+  ) %>% 
+  mutate(dose_equiv_bin=factor(dose_equiv_bin, levels=c("0", "0-5", "5-10", "10-15", ">15"))) 
+
+ad_paired <- 
+  ad_ster %>% 
+  mutate(cohort_3lvl=case_when(
+    grepl("control", akra_cohort)~"Control",
+    .default=akra_cohort
+  )) %>% 
+  arrange(record_id, day_rel_car) %>%
+  select(cohort_2lvl, akra_cohort, subclass, record_id, day_rel_car, dose_equiv) %>%
+  mutate(akra_cohort=ifelse(grepl("1", akra_cohort), "cohort1", "cohort2")) %>% 
+  group_by(cohort_2lvl, akra_cohort, subclass, record_id) %>% reframe(total_dose=(sum(dose_equiv))) %>% ungroup() %>%
+  select(!record_id) %>% pivot_wider(names_from = "cohort_2lvl", values_from = "total_dose")
+
+# Comparison between study and PSM cohort for total number of IL6B doses administered
+ster_ttest <- t.test(ad_paired$anakinra, ad_paired$control, paired = T)
+
+# Descriptive statistics
+ster_quant_akra <- quantile( (ad_paired)$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+ster_quant_control <- quantile( (ad_paired)$control, probs=c(0.25, 0.5, 0.75) ) 
+
+ster_quant_c1 <- quantile( (ad_paired %>% filter(akra_cohort=="cohort1"))$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+ster_quant_c2 <- quantile( (ad_paired %>% filter(akra_cohort=="cohort2"))$anakinra, probs=c(0.25, 0.5, 0.75) ) 
+
+# How much more steroids did each study patient receive over their matched pair
+ad_paired1 <- ad_paired %>% mutate(ddiff = anakinra-control) %>%
+  select(!c(anakinra, control)) %>% 
+  pivot_wider(names_from = "akra_cohort", values_from = "ddiff")
+ster_quant_c1_diff <- quantile( (ad_paired1 %>% drop_na(cohort1))$cohort1, probs=c(0.25, 0.5, 0.75) ) 
+ster_quant_c2_diff <- quantile( (ad_paired1 %>% drop_na(cohort2))$cohort2, probs=c(0.25, 0.5, 0.75) ) 
+
+
+ad_cum <- ad_ster %>% 
+  mutate(cohort_3lvl=case_when(
+    grepl("control", akra_cohort)~"Control",
+    .default=akra_cohort
+  )) %>% 
+  arrange(record_id, day_rel_car) %>%
+  filter(!grepl("control", cohort_2lvl)) %>% 
+  select(cohort_3lvl, record_id, day_rel_car, dose_equiv)  %>%
+  group_by(record_id) %>% 
+  mutate(cumdose=cumsum(dose_equiv)) %>% ungroup() %>%
+  group_by(cohort_3lvl, day_rel_car) %>% reframe(med_dose=mean(cumdose),
+                                              low_conf=quantile(cumdose, probs=c(0.25)[1]),
+                                              high_conf=quantile(cumdose, probs=c(0.75)[1])
+                                              ) %>% ungroup() %>%
+  ggplot(aes(x=day_rel_car, y=med_dose, color=cohort_3lvl, fill=cohort_3lvl)) + 
+  #geom_ribbon(aes(ymin = low_conf, ymax = high_conf), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_point() 
+  
+ad_cum
+  
+ad1 <- ad_ster %>% ggplot(aes(x=day_rel_car, y=trial_subclass, fill=dose_equiv_bin)) + 
+  facet_wrap(.~cohort_2lvl) + 
+  geom_tile(color = "black", linewidth = 0.3) +
+  #scale_fill_gradient(low = "white", high = "#08306b") +
+  scale_fill_manual(
+    values = c("0" = "white",
+               "0-5" = "#6baed6",
+               "5-10" = "#2171b5",
+               "10-15" = "#08519c",
+               ">15" = "#08306b"),
+    name = "Dose (mg/kg)"
+  ) +
+  theme_classic() + 
+  theme(legend.position="bottom")
+
+ad1
+
+ggsave(here(figures_dir, "figs7.pdf"), plot=ad1, width = 8, height=12, dpi = 150)
+```
+
+# Efficacy Analysis
+
+## Figure 3A
+
+```{r, fig.width=5, fig.height=5, dpi=150}
+os_plot <- ggsurvfit(survfit2(
+  Surv(tt_os_m, ev_os)~akra_cohort,
+  data=m1 %>% filter(akra_cohort %in% c("cohort1", "cohort2"))),
+  size=1.1) +
+  add_risktable(risktable_stats=c('n.risk'))+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Overall Survival') + 
+  theme_classic() +
+  theme(text = element_text(family = "sans"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12),
+        legend.position='none') + 
+  scale_color_manual(values=c("#1F5AA6", "#087F8C"))
+print(os_plot)
+ggsave(here(figures_dir, "fig3a.pdf"), plot = os_plot, width = 5, height = 5)
+```
+
+## Figure 3B
+
+```{r, fig.width=5, fig.height=5, dpi=150}
+ri_plot <- ggcuminc(tidycmprsk::cuminc(
+  Surv(tt_pfs_m, ev_rel)~akra_cohort,
+  data=m1 %>% filter(akra_cohort %in% c("cohort1", "cohort2"))),
+  outcome='1',
+  size=1.1) +
+  add_risktable(risktable_stats = c('cum.event'))+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Cumulative Relapse Incidence') + 
+  theme_classic() +
+  theme(text = element_text(family = "Arial"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12),
+        legend.position='none') + 
+  scale_color_manual(values=c("#1F5AA6", "#087F8C"))
+print(ri_plot)
+ggsave(here(figures_dir, "fig3b.pdf"), plot = os_plot, width = 5, height = 5)
+```
+
+## Figure S11
+```{r, fig.width=5, fig.height=5, dpi=150}
+library(ggsurvfit)
+pfs_plot <- ggsurvfit(survfit2(
+  Surv(tt_pfs_m, ev_pfs)~akra_cohort,
+  data=m1 %>% filter(akra_cohort %in% c("cohort1", "cohort2"))),
+  linewidth=1.1) +
+  add_risktable(risktable_stats=c('n.risk'))+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Progression-Free Survival') + 
+  theme_classic() +
+  theme(text = element_text(family = "sans"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12),
+        legend.position='none') + 
+  scale_color_manual(values=c("#1F5AA6", "#087F8C", "#1F5AA6", "#087F8C"))
+print(pfs_plot)
+ggsave(here(figures_dir, "suppfig11.pdf"), plot = pfs_plot, width = 5, height = 5)
+
+```
+## Reportable Survival Metrics
+```{r}
+
+# Cohort 2 
+
+## Follow-up
+rev_km <- survfit(Surv(tt_os_m, 1 - ev_os) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort2")))
+rev_km     
+
+## OS, PFS, and Relapse/POD
+fit_os <- survfit(Surv(tt_os_m, ev_os) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort2")))
+fit_pfs <- survfit(Surv(tt_pfs_m, ev_pfs) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort2")))
+fit_rel <- tidycmprsk::cuminc(Surv(tt_pfs_m, ev_rel) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort2")))
+
+summary(fit_os, times = 12)   
+summary(fit_pfs, times = 12)
+tidy(fit_rel, time=12)
+
+# Cohort 1
+rev_km <- survfit(Surv(tt_os_m, 1 - ev_os) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort1")))
+rev_km     
+
+fit_os <- survfit(Surv(tt_os_m, ev_os) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort1")))
+fit_pfs <- survfit(Surv(tt_pfs_m, ev_pfs) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort1")))
+fit_rel <- tidycmprsk::cuminc(Surv(tt_pfs_m, ev_rel) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort1")))
+
+summary(fit_os, times = 12)   
+summary(fit_pfs, times = 12)   
+tidy(fit_rel, time=12)
+
+# PSM Control Cohort Follow Up
+rev_km <- survfit(Surv(tt_os_m, 1 - ev_os) ~ 1, data=m1 %>% filter(cohort_2lvl %in% c("control")))
+rev_km     
+
+# Relapse/POD across both cohorts 1 and 2
+fit_rel <- tidycmprsk::cuminc(Surv(tt_pfs_m, ev_rel) ~ 1, data=m1 %>% filter(akra_cohort %in% c("cohort1", "cohort2")))
+tidy(fit_rel, time=12)
+
+
+```
+
+## Figure 3C - Matched Swimmer's Plot for comparing POD and death
+```{r, fig.width=10, fig.height=15, dpi=150}
+ulm=80
+
+ord_surv <- matched_data %>%
+  filter(cohort_2lvl=="control") %>%
+  mutate(otcm=tt_os_m) %>% 
+  select(otcm, subclass) %>%
+  mutate(ords=rank(otcm))
+
+subclass_cohort <- matched_data %>%
+  filter(cohort_2lvl=="anakinra") %>%
+  select(akra_cohort_pair=akra_cohort, subclass)
+
+relapse_patients <- matched_data %>% 
+  filter(ev_pfs==1) %>%
+  select(record_id, tt_pfs_m, tt_os_m, ev_rel) %>% 
+  mutate(pod=ifelse(tt_pfs_m < tt_os_m, "POD", NA)) %>%
+  drop_na(pod)
+
+swimmer <- matched_data %>% 
+  left_join(ord_surv %>% select(subclass, ords)) %>% 
+  left_join(subclass_cohort %>% select(akra_cohort_pair, subclass)) %>% 
+  mutate(subclass=factor(subclass)) %>% 
+  mutate(tt_os_m=ifelse(tt_os_m>ulm, ulm, tt_os_m)) %>% 
+  mutate(ev_os = ifelse(tt_os_m>ulm, 0, ev_os)) %>% 
+  mutate(tt_pfs_m=ifelse(tt_pfs_m>ulm, ulm, tt_pfs_m)) %>% 
+  mutate(ev_pfs = ifelse(tt_pfs_m>ulm, 0, ev_pfs)) %>% 
+  mutate(rel_ev=ifelse(record_id %in% relapse_patients$record_id, "POD", NA)) %>% 
+  ggplot(aes(x=tt_os_m, y=reorder(subclass, ords), fill=factor(ev_os))) + 
+  geom_bar(stat="identity") +
+  geom_point(aes(x=tt_pfs_m, y=subclass, shape=rel_ev)) + 
+  facet_grid(akra_cohort_pair~cohort_2lvl, scales = "free") +
+  scale_x_continuous(
+    limits = c(0, 80),
+    breaks = c(0, 12, 24, 36, 48, 60, 72),
+    labels= as.character(c(0, 12, 24, 36, 48, 60, 72))
+  ) + 
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Treatment-Control Pair') + 
+  theme_classic() + 
+  theme(text = element_text(family = "Arial"),
+        axis.title = element_text(size=18),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_blank(),
+        strip.text = element_text(size=16),
+        
+        legend.position='none') + 
+  scale_fill_d3()
+print(swimmer)
+
+ggsave(here(figures_dir, "fig3c.pdf"), plot=swimmer, width=10, height=15, dpi=150)
+```
+
+## Figure 3F CAR transgene quantification
+```{r, fig.width=5, fig.height=5, dpi=150}
+library(ggpubr)
+mddpcr <- m1 %>% drop_na(ddpcr) 
+#m8 %>% select(cohort_2lvl) %>% table()
+
+ddpcr_plot <- mddpcr %>% ggplot(aes(x=cohort_2lvl, color=cohort_2lvl, fill=cohort_2lvl,  y=log(ddpcr+1e-3))) + geom_boxplot(alpha=0.4) + geom_jitter(size=4) + ylab("") + xlab("") + scale_color_manual(values=c("darkred", "#5B4BB2")) + scale_fill_manual(values=c("darkred", "#5B4BB2"))
+
+print(ddpcr_plot)
+
+ggsave(here(figures_dir, "fig3f.pdf"), plot=ddpcr_plot, width=10, height=15, dpi=150)
+```
+
+## Figure S12 PSM efficacy/survival analyses
+```{r}
+binary_outcomes <- c(
+  'CR by 1 Year'
+)
+
+surv_outcomes <- tribble(
+  ~outcome, ~time,       ~event,
+  "PFS",    "tt_pfs_m",  "ev_pfs",
+  "OS",     "tt_os_m",   "ev_os"
+)
+
+inc_outcomes <- tribble(
+  ~outcome, ~time,       ~status, ~failcode,
+  "Relapse",    "tt_pfs_m",  "ev_rel", 1)
+
+
+cohort_var <- 'cohort_2lvl'
+cohort_levels <- levels(factor(common_clean[[cohort_var]]))
+
+
+binary_tbl <-
+  map_dfr(binary_outcomes, function(outcome) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Binary",
+      psmcontrol_summary = fmt_binary(ccpsm, outcome, cohort_levels[1], cohort_var),
+      
+      psmtx_summary = fmt_binary(ccpsm, outcome, cohort_levels[2], cohort_var),
+      
+      effect = fmt_or(ccpsm, outcome, cohort_var),
+      pval = fmt_or_pval(ccpsm, outcome, cohort_var)
+      
+    )
+  })
+
+surv_tbl <-
+  pmap_dfr(surv_outcomes, function(outcome, time, event) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Time-to-event",
+      psmcontrol_summary = fmt_median_surv(ccpsm, time, event, cohort_levels[1], cohort_var),
+      
+      psmtx_summary = fmt_median_surv(ccpsm, time, event, cohort_levels[2], cohort_var),
+      
+      effect = fmt_hr(ccpsm, time, event, cohort_var),
+      pval = fmt_hr_pval(ccpsm, time, event, cohort_var)
+    )
+  })
+
+inc_tbl <-
+  pmap_dfr(inc_outcomes, function(outcome, time, status, failcode) {
+    tibble(
+      outcome = outcome,
+      outcome_type = "Cumulative Incidence at 12 months",
+      psmcontrol_summary = calc_cif_at_time(data = ccpsm,time=time,status=status,failcode=failcode,cohort_level=cohort_levels[1],cohort_var=cohort_var),
+      
+      psmtx_summary = calc_cif_at_time(data = ccpsm,time=time,status=status,failcode=failcode,cohort_level=cohort_levels[2],cohort_var=cohort_var),
+      
+      effect = fmt_cihr(data=ccpsm, time=time, event=status, cohort_var=cohort_var, etype=as.character(failcode)),
+      pval = fmt_cihr_pval(data=ccpsm, time=time, event=status, cohort_var=cohort_var, etype=as.character(failcode))
+    )
+  })
+
+library(gt)
+
+final_outcome_tbl <-
+  bind_rows(binary_tbl, surv_tbl, inc_tbl) %>%
+  gt(groupname_col = "outcome_type") |>
+  cols_label(
+    outcome = md("**Outcome**"),
+    #cohort_2_summary = md(paste0("**", 'Cohort 2', "**")),
+    psmcontrol_summary = md(paste0("**", cohort_levels[1], "**")),
+    psmtx_summary = md(paste0("**", cohort_levels[2], "**")),
+    effect = md("**OR/HR (95% CI)**"),
+    pval = md("**p value**")
+  ) |>
+  cols_align(
+    align = "center",
+    columns = c(psmtx_summary, psmcontrol_summary, effect)
+  )
+final_outcome_tbl
+
+final_outcome_tbl %>%
+  gtsave(here(figures_dir, "figs12.docx"))
+```
+
+# Sensitivity Analyses for PFS Association
+
+## Sensitivity Analyses for Variance correction
+```{r}
+df <- m1 %>%
+  mutate(
+    trt = case_when(
+      akra_cohort %in% c("cohort1", "cohort2") ~ 1,
+      akra_cohort %in% c("cohort1 control", "cohort2 control") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    match_groups = case_when(
+      akra_cohort %in% c("cohort1", "cohort1 control") ~ "cohort1",
+      akra_cohort %in% c("cohort2", "cohort2 control") ~ "cohort2",
+      TRUE ~ NA_character_
+    ),
+    match_groups = factor(match_groups, levels = c("cohort1", "cohort2")),
+  )
+
+cat('\n\nPrimary analysis.\n')
+summary(coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt + strata(subclass),
+  data = df
+))
+
+cat('\n\nSensitivity analysis with robust variance estimation\n ')
+summary(coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt + strata(subclass) + cluster(subclass),
+  data = df
+))
+
+cat('\n\nThere is no evidence that treatment/prophylaxis effect differs between cohort 1 and cohort 2\n ')
+summary(coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt + trt:c2 + strata(subclass),
+  data = df %>%  mutate(c2 = as.integer(match_groups == "cohort2"))
+))
+
+```
+
+## Sensitivity Analyses for Variation in Matching
+
+```{r}
+# Matching with active CNS disease at infusion also considered
+dfw <- df_nomissing %>% drop_na(active_cns) 
+set.seed(1)
+match_obj <- matchit(cohort_2lvl ~ age + kps_2lvl + costim + dx_heme + ds_res_infusion + bin_preld_ldh + active_cns, 
+                     data = dfw,
+                     method = "optimal",
+                     distance = "logit", 
+                     ratio=1
+)
+love.plot(match_obj, abs = T, thresholds = 0.1)
+
+# SMD for distance = 0.15 (worse compared to SMD for distance without active CNS disease matching)
+(love.plot(match_obj, abs = T, thresholds = 0.1)@data %>% filter(Sample=="Adjusted") %>% filter(var=="distance"))$stat
+
+matched_data <- match.data(match_obj)
+summary(coxph(Surv(tt_pfs_m, ev_pfs) ~ cohort_2lvl + strata(subclass),
+              data = matched_data))
+```
+
+#### Matching with current variables + active CNS disease + Pre-infusion CRP (continuous)
+```{r}
+dfw <- df_nomissing %>% drop_na(active_cns, d0_crp) 
+set.seed(1)
+match_obj <- matchit(cohort_2lvl ~ age + kps_2lvl + costim + dx_heme + ds_res_infusion + bin_preld_ldh + active_cns + log(d0_crp), 
+                     data = dfw,
+                     method = "optimal",
+                     distance = "logit", 
+                     ratio=1
+)
+love.plot(match_obj, abs = T, thresholds = 0.1)
+matched_data <- match.data(match_obj)
+summary(coxph(Surv(tt_pfs_m, ev_pfs) ~ cohort_2lvl + strata(subclass),
+              data = matched_data))
+```
+
+#### Matching with current variables + active CNS disease + Pre-infusion CRP (binary)
+
+CRP above or below median value (median across both treatment and non-treated patients)
+
+```{r}
+dfw <- df_nomissing %>% drop_na(active_cns, d0_crp) 
+set.seed(1)
+match_obj <- matchit(cohort_2lvl ~ age + kps_2lvl + costim + dx_heme + ds_res_infusion + bin_preld_ldh + active_cns + bin_d0_crp, 
+                     data = dfw,
+                     method = "optimal",
+                     distance = "logit", 
+                     ratio=1
+)
+love.plot(match_obj, abs = T, thresholds = 0.1)
+matched_data <- match.data(match_obj)
+summary(coxph(Surv(tt_pfs_m, ev_pfs) ~ cohort_2lvl + strata(subclass),
+              data = matched_data))
+```
+
+### Figure 3D - PFS inference is robust to different matching algorithms (IPTW)
+### Figure 3F - Relapse/POD with IPTW
+
+```{r, fig.width=5, fig.height=5, dpi=150}
+library(WeightIt)
+dfw <- df_nomissing %>% drop_na(active_cns, bin_d0_crp)
+set.seed(1)
+w <- weightit(cohort_2lvl ~ age + kps_2lvl +  costim + dx_heme + ds_res_infusion + bin_preld_ldh + active_cns + bin_d0_crp, 
+              data = dfw, method = 'glm',  estimand = "ATT")
+dfw$iptw <- w$weights
+summary(coxph(Surv(tt_pfs_m, ev_pfs) ~ cohort_2lvl,
+      data = dfw,
+      weights = iptw,
+      robust = TRUE
+      ))
+
+fg_iptw <- finegray(
+  Surv(tt_pfs_m, ev_rel) ~ cohort_2lvl+record_id,
+  data = dfw %>% mutate(ev_rel=factor(ev_rel)) %>% drop_na(ev_rel),
+  weights = iptw,
+  etype = "1"
+)
+
+fit_fg <- coxph(
+  Surv(fgstart, fgstop, fgstatus) ~ cohort_2lvl,
+  data = fg_iptw,
+  weights = fgwt*`(weights)`,
+  id = record_id,
+  robust=T
+)
+
+summary(fit_fg)
+
+fit <- survfit2(Surv(tt_pfs_m, ev_pfs) ~ cohort_2lvl, 
+               data = dfw, weights = iptw)
+fit2 <- survfit2(Surv(tt_pfs_m, ev_rel) ~ cohort_2lvl, 
+               data = dfw, weights = iptw)
+
+iptw_plot <- ggsurvfit(fit, linewidth=1.1) + 
+  add_risktable(
+                 risktable_stats = "{format(round(n.risk, 1), nsmall = 1)}")+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  add_pvalue() +
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Progression-Free Survival') + 
+  theme_classic() +
+  theme(text = element_text(family = "sans"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12),
+        legend.position='bottom') + 
+  scale_color_manual(values=c("darkred", "#5B4BB2"))
+
+iptw_plot_ri <- ggcuminc(fit2, linewidth=1.1) + 
+  add_risktable(
+                 risktable_stats = "{format(round(cum.event, 1), nsmall = 1)}")+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Progression-Free Survival') + 
+  theme_classic() +
+  theme(text = element_text(family = "sans"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12),
+        legend.position='bottom') + 
+  scale_color_manual(values=rev(c("darkred", "#5B4BB2")))
+
+print(iptw_plot)
+print(iptw_plot_ri)
+ggsave(here(figures_dir, "fig3d.pdf"), plot = iptw_plot, width = 5, height = 5)
+ggsave(here(figures_dir, "fig3e.pdf"), plot = iptw_plot_ri, width = 5, height = 5)
+
+```
+
+
+# Anakinra Prophylaxis and Systemic Inflammation
+
+## Figure S13 - Modeling interaction between Anakinra Prophylaxis and Baseline CRP.
+```{r}
+library(splines)
+library(sandwich)
+library(lmtest)
+
+df <- df %>%
+  mutate(
+    crp_group = factor(
+      bin_d0_crp,
+      levels = c(0, 1),
+      labels = c("WNL", "Elevated")
+    ),
+    trt_wnl = trt * as.integer(bin_d0_crp == 0),
+    trt_elevated = trt * as.integer(bin_d0_crp == 1)
+  ) %>%
+  mutate(logcrp=log(d0_crp)) %>%
+  mutate(
+    trt_c1_wnl = as.integer(trt == 1 & match_groups == "cohort1" & crp_group == "WNL"),
+    trt_c2_wnl = as.integer(trt == 1 & match_groups == "cohort2" & crp_group == "WNL"),
+    trt_c1_elev = as.integer(trt == 1 & match_groups == "cohort1" & crp_group == "Elevated"),
+    trt_c2_elev = as.integer(trt == 1 & match_groups == "cohort2" & crp_group == "Elevated")
+  ) 
+
+fit_spline_linear <- coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt * logcrp,
+  data = df,
+  cluster = subclass
+)
+
+fit_spline <- coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt * ns(logcrp, df = 2),
+  data = df,
+  cluster = subclass
+)
+
+cat("\nA model fit where CRP is modeled non-linearly fits the data better than when CRP is modeled linearly.\n")
+lmtest::lrtest(fit_spline, fit_spline_linear)
+
+b <- coef(fit_spline)
+V <- vcov(fit_spline)
+
+int_terms <- grep("trt:ns\\(logcrp, df = 2\\)|ns\\(logcrp, df = 2\\).*:trt",
+                  names(b),
+                  value = TRUE)
+
+L <- matrix(
+  0,
+  nrow = length(int_terms),
+  ncol = length(b),
+  dimnames = list(int_terms, names(b))
+)
+
+for (i in seq_along(int_terms)) {
+  L[i, int_terms[i]] <- 1
+}
+
+W <- as.numeric(t(L %*% b) %*% solve(L %*% V %*% t(L)) %*% (L %*% b))
+p_interaction <- pchisq(W, df = nrow(L), lower.tail = FALSE)
+
+data.frame(
+  test = "Joint nonlinear treatment-by-logCRP interaction",
+  chi_square = W,
+  df = nrow(L),
+  p = p_interaction
+)
+
+```
+
+```{r, fig.width=7, fig.height=5, dpi=150, fig.keep='last'}
+crp_values <- c(1, 3, 5, 10, 20, 40, 80)
+
+hr_table <- hr_curve_from_spline(
+  fit_spline,
+  logcrp_values = log(crp_values)
+) %>%
+  mutate(d0_crp = crp_values)
+
+
+grid_logcrp <- seq(
+  quantile(df$logcrp, 0.02, na.rm = TRUE),
+  quantile(df$logcrp, 0.98, na.rm = TRUE),
+  length.out = 200
+)
+
+hr_curve <- hr_curve_from_spline(fit_spline, grid_logcrp)
+
+hr_curve <- hr_curve %>%
+  mutate(d0_crp = exp(logcrp))
+
+crp_interact <- ggplot(hr_curve, aes(x = d0_crp*0.5, y = HR)) +
+  geom_ribbon(aes(ymin = lower_95, ymax = upper_95), alpha = 0.2) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_rug(
+    data = df,
+    aes(x = exp(logcrp)*0.5),
+    inherit.aes = FALSE,
+    alpha = 0.25
+  ) +
+  geom_vline(xintercept=median(exp(df$logcrp)*0.5, na.rm = T), color="darkred") + 
+  labs(
+    x = "Baseline CRP",
+    y = "Anakinra vs control HR for PFS event",
+    title = "Nonlinear modification of anakinra association by baseline CRP"
+  ) +
+  xlim(0, 20)+
+  ylim(0, 3) + 
+  theme_classic()
+
+print(crp_interact)
+ggsave(here(figures_dir, "figs13.pdf"), width=7, height=5, dpi=150)
+```
+
+## Determining Effect of Anakinra within CRP High Group
+```{r}
+cat("\nEstimated effect size and significance for cohort 2 vs cohort 2 control and cohort 1 vs c1 control without explicitly modeling an interaction term. Variance estimation accounts for clustering within matched pairs.\n")
+coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ 
+    trt_wnl+
+    trt_elevated+
+    strata(crp_group) +
+    cluster(subclass),
+  data = df
+)
+
+
+```
+
+## Figure 4A - Visualize outcomes stratified by CRP.
+```{r, fig.width=10, fig.height=10, dpi=150}
+pfs_by_crp <- ggsurvfit(survfit2(Surv(tt_pfs_m, ev_pfs)~trt+crp_group,
+                                 data=df
+                                 ), linewidth=1.1, linetype_aes = TRUE) +
+  add_risktable(risktable_stats=c('n.risk'))+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Progression-Free Survival') + 
+  theme_classic() +
+  theme(text = element_text(family = "sans"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12),
+        legend.position='bottom'
+        ) +
+  scale_color_manual(values=c("darkred", 'darkred', "#5B4BB2", '#5B4BB2'))+
+  scale_linetype_manual(values=c("solid", "longdash", "solid", "longdash"))
+
+# Dashed lines are CRP High. So among high CRP patients, treatment improves outcomes more than among low CRP patients. 
+print(pfs_by_crp)
+ggsave(here(figures_dir, 'fig4a.pdf'), plot = pfs_by_crp, width = 5, height = 5)
+
+```
+
+## Figure 4B Exploratory analysis: Is there a difference in anakinra treatment effect in the context of baseline inflammation depending on whether a Cohort 1 or Cohort 2 schedule is implemented.
+
+```{r, fig.width=5, fig.height=7, dpi=150}
+
+fit_cell <- coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ 
+    trt_c1_wnl +
+    trt_c2_wnl +
+    trt_c1_elev +
+    trt_c2_elev +
+    strata(match_groups, crp_group) +
+    cluster(subclass),
+  data = df
+)
+
+fcs <- summary(fit_cell)
+
+results <- data.frame(
+  label = c("C1 Normal CRP", "C2 Normal CRP", "C1 Elevated CRP", "C2 Elevated CRP"),
+  HR = fcs$coefficients[,2],
+  lower =fcs$conf.int[,3],
+  upper = fcs$conf.int[,4]
+)
+
+results$label <- factor(results$label, levels = rev(results$label))
+
+fp_cohorts <- ggplot(results, aes(x = HR, y = label)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  scale_x_log10() +
+  labs(x = "Hazard Ratio (95% CI)", y = NULL) +
+  theme_minimal()
+
+print(fp_cohorts)
+ggsave(here(figures_dir, 'fig4b.pdf'), plot = fp_cohorts, width = 5, height = 5)
+```
+
+### Sensitivity analysis - Anakinra prophylaxis is associated with improved PFS with higher systemic inflammation even with an alternative matching strategy
+
+We will see whether our treatment-by-CRP interaction findings hold when matching on additional variables (active cns disease, Day 0 CRP) and using an IPTW match design.
+
+```{r}
+dfw <- df_nomissing %>% drop_na(active_cns, bin_d0_crp)
+set.seed(1)
+w <- weightit(cohort_2lvl ~ age + kps_2lvl +  costim + dx_heme + ds_res_infusion + bin_preld_ldh + active_cns + bin_d0_crp, 
+              data = dfw, method = 'glm',  estimand = "ATT")
+
+dfw$iptw <- w$weights
+
+dfw1 <- dfw %>%
+  mutate(
+    trt = case_when(
+      akra_cohort %in% c("cohort 1", "cohort 2") ~ 1,
+      akra_cohort %in% c("no anakinra") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    match_groups = case_when(
+      akra_cohort %in% c("cohort1", "cohort1 control") ~ "cohort1",
+      akra_cohort %in% c("cohort2", "cohort2 control") ~ "cohort2",
+      TRUE ~ NA_character_
+    ),
+    match_groups = factor(match_groups, levels = c("cohort1", "cohort2")),
+  ) %>%
+  mutate(
+    crp_group = factor(
+      bin_d0_crp,
+      levels = c(0, 1),
+      labels = c("WNL", "Elevated")
+    ),
+    trt_wnl = trt * as.integer(bin_d0_crp == 0),
+    trt_elevated = trt * as.integer(bin_d0_crp == 1)
+  ) %>%
+  mutate(logcrp=log(d0_crp)) %>%
+  mutate(
+    trt_c1_wnl = as.integer(trt == 1 & match_groups == "cohort1" & crp_group == "WNL"),
+    trt_c2_wnl = as.integer(trt == 1 & match_groups == "cohort2" & crp_group == "WNL"),
+    trt_c1_elev = as.integer(trt == 1 & match_groups == "cohort1" & crp_group == "Elevated"),
+    trt_c2_elev = as.integer(trt == 1 & match_groups == "cohort2" & crp_group == "Elevated")
+  ) 
+
+library(survminer)
+
+fit_spline_linear <- coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt * logcrp,
+  data = dfw1,
+  weights = iptw,
+  robust = TRUE
+)
+
+fit_spline <- coxph(
+  Surv(tt_pfs_m, ev_pfs) ~ trt * ns(logcrp, df=2),
+  data = dfw1,
+  weights = iptw,
+  robust = TRUE
+)
+
+cat("\nA model fit where CRP is modeled non-linearly again fits the data better than when CRP is modeled linearly.\n")
+lmtest::lrtest(fit_spline, fit_spline_linear)
+
+b <- coef(fit_spline)
+V <- vcov(fit_spline)
+
+int_terms <- grep("trt:ns\\(logcrp, df = 2\\)|ns\\(logcrp, df = 2\\).*:trt",
+                  names(b),
+                  value = TRUE)
+
+L <- matrix(
+  0,
+  nrow = length(int_terms),
+  ncol = length(b),
+  dimnames = list(int_terms, names(b))
+)
+
+for (i in seq_along(int_terms)) {
+  L[i, int_terms[i]] <- 1
+}
+
+W <- as.numeric(t(L %*% b) %*% solve(L %*% V %*% t(L)) %*% (L %*% b))
+p_interaction <- pchisq(W, df = nrow(L), lower.tail = FALSE)
+
+cat("\nWhen modeled non-linearly (2nd order spline), baseline CRP again has a significant interaction with anakinra prophylaxis in its effect on PFS.\n")
+data.frame(
+  test = "Joint nonlinear treatment-by-logCRP interaction",
+  chi_square = W,
+  df = nrow(L),
+  p = p_interaction
+)
+
+```
+
+### Figure S14. This interaction is again visualized here
+
+```{r, fig.width=5, fig.height=5, dpi=150}
+fit <- survfit2(Surv(tt_pfs_m, ev_pfs) ~ cohort_2lvl + bin_d0_crp, 
+               data = dfw1, weights = iptw)
+sfig9 <- ggsurvfit(fit, linewidth=1.1, linetype_aes = TRUE) +
+add_risktable(
+                 risktable_stats = "{format(round(n.risk, 1), nsmall = 1)}")+
+  scale_x_continuous(
+    limits = c(0, 36),
+    breaks = c(0, 6, 12, 18, 24, 30, 36),
+    labels= as.character(c(0, 6, 12, 18, 24, 30, 36))
+  ) + 
+  ylim(0,1) +
+  xlab('Time from CAR-T Infusion') + 
+  ylab('Progression-Free Survival') + 
+  theme_classic() +
+  theme(text = element_text(family = "sans"),
+        axis.title = element_text(size=14),
+        axis.text = element_text(size=12)) + 
+  scale_color_manual(values=c("darkred", 'darkred', "#5B4BB2", '#5B4BB2'))+
+  scale_linetype_manual(values=c("solid", "longdash", "solid", "longdash"))
+print(sfig9)
+
+ggsave(here(figures_dir, 'suppfig16.pdf'), width = 5, height = 5)
+
+```
+
+# Anakinra Prophylaxis and ALC trajectories
+
+```{r}
+## preparing laboratory and cytokine data for downstream analysis. 
+akra_csum_dose <- akra_doses %>%
+  arrange(record_id, day_rel_car) %>%
+  mutate(daily_dose=as.numeric(daily_dose)) %>%
+  group_by(record_id) %>%
+  mutate(cdose = cumsum(daily_dose)) %>%
+  ungroup() 
+
+df_csum <- data.frame(record_id=rep(m1$record_id, each=39), day_rel_car=rep(seq(from=-3, to=35, by=1), times=length(m1$record_id))) %>%
+  arrange(record_id, day_rel_car) %>% 
+  left_join(m1 %>% select(record_id, akra_cohort))  %>%
+  left_join(akra_csum_dose) %>%
+  distinct() %>% 
+  mutate(cdose=ifelse(day_rel_car==-3, 0, cdose)) %>%
+  mutate(daily_dose=ifelse(is.na(daily_dose), 0, daily_dose)) %>%
+  arrange(record_id, day_rel_car) %>%
+  fill(cdose, .direction = "down") %>%
+  filter(day_rel_car <= 35) %>% distinct()
+
+bin_visit <- function(day) {
+  case_when(
+    day <= 0             ~ "Baseline",
+    day >= 1  & day <= 7 ~ "W1",
+    day >= 8  & day <= 14 ~ "W2",
+    day >= 15 & day <= 21 ~ "W3",
+    day >= 21 & day <= 28 ~ "W4",
+    TRUE                 ~ NA_character_
+  )
+}
+
+dat_pre <- df %>%
+  transmute(
+    record_id = factor(record_id),
+    subclass = factor(subclass),
+    trt_f = factor(
+      trt,
+      levels = c(0, 1),
+      labels = c("control", "anakinra")
+    ),
+    akra_cohort_f = factor(
+      akra_cohort,
+      levels = c(
+        "cohort1 control",
+        "cohort1",
+        "cohort2 control",
+        "cohort2"
+      )
+    ),
+    akra_cohort_3lvl_f = factor(
+      case_when(
+        grepl('control', akra_cohort)~"control",
+        akra_cohort=="cohort1"~"cohort1",
+        akra_cohort=="cohort2"~"cohort2",
+        TRUE ~ NA_character_
+      ),
+      levels = c("control", "cohort1", "cohort2")
+    ),
+    match_groups_f=factor(match_groups, levels=c("cohort1", "cohort2")),
+    sex_f = factor(sex),
+    age_c = as.numeric(scale(age, center = TRUE, scale = FALSE)),
+    costim_f=factor(costim)
+  ) 
+
+### OLINK
+# These cytokines did not pass QC for our analysis, the majority of values were under the limit of detection. 
+mostly_under_lod <- c("il1_a", "adgrg1", "fgf2", "nos3", "il2", "vegfc", "il33", "il5", "arg1", "ptn", "cxcl12", "il4", "il13")
+
+dat_olink <- match_olink %>% 
+  mutate(
+    visit_f = factor(bin_visit(day_rel_car),
+               levels = c("Baseline", "W1", "W2", "W3", "W4"))
+  ) %>%
+  select(!matches(mostly_under_lod)) %>%
+  mutate(across(il8:csf_1, ~as.numeric(.))) %>% drop_na() %>%
+  left_join(dat_pre, by="record_id") %>%
+  drop_na(trt_f) %>%
+  left_join(df_nomissing %>% select(record_id, tt_crs_d, ev_crs)) %>%
+  mutate(crs=factor(case_when(
+    is.na(ev_crs)~NA,
+    ev_crs==1 & day_rel_car>=tt_crs_d~1,
+    .default=0
+  )
+  )) %>%
+  mutate(
+     crs_f = factor(
+      crs,
+      levels = c(0, 1),
+      labels = c("no_prior_crs", "prior_crs")
+    ),
+  day_rel_car=as.integer(day_rel_car)
+  ) %>%
+    select(!c(ev_crs, tt_crs_d, crs)) %>% 
+  pivot_longer(!c(record_id, day_rel_car, akra_cohort_f, akra_cohort_3lvl_f, trt_f, match_groups_f, subclass, crs_f, age_c, sex_f, costim_f, visit_f), names_to = "lab", values_to = "npx" ) %>%
+  mutate(lab = factor(lab)) 
+
+
+### LABS
+labs_interest <- c("crp", "anc", "alc", 'plt')
+
+dat_labs_pre <- infl_lab_trend %>% 
+  mutate(
+    visit_f = factor(bin_visit(day_rel_car),
+               levels = c("Baseline", "W1", "W2", "W3", "W4"))
+  ) %>%
+  left_join(dat_pre, by="record_id") %>%
+  drop_na(trt_f) %>% 
+  left_join(df_nomissing %>% select(record_id, tt_crs_d, ev_crs)) %>%
+  mutate(crs=factor(case_when(
+    is.na(ev_crs)~NA,
+    ev_crs==1 & day_rel_car>=tt_crs_d~1,
+    .default=0
+  )
+  )) %>%
+  mutate(
+     crs_f = factor(
+      crs,
+      levels = c(0, 1),
+      labels = c("no_prior_crs", "prior_crs")
+    ),
+  day_rel_car=as.integer(day_rel_car)
+  ) %>%
+   select(!c(ev_crs, tt_crs_d, crs)) %>% 
+   filter(lab %in% c(labs_interest, "wbc")) %>%
+   group_by(record_id, lab, day_rel_car) %>% slice(which.max(result_value/uln)) %>% ungroup() 
+
+
+fixzero_alc <- dat_labs_pre %>% filter(lab =="wbc") %>% mutate(wbc=result_value) %>%
+  left_join(
+    dat_labs_pre %>% filter(lab =="alc") %>% select(record_id, alc=result_value, day_rel_car)
+  ) %>% filter(is.na(alc)&wbc <= 0.5) %>%
+  mutate(lab="alc", result_value=0, uln=0.3) %>% select(!c(wbc, alc))
+
+fixzero_anc <- dat_labs_pre %>% filter(lab =="wbc") %>% mutate(wbc=result_value) %>%
+  left_join(
+    dat_labs_pre %>% filter(lab =="anc") %>% select(record_id, anc=result_value, day_rel_car)
+  ) %>% filter(is.na(anc)&wbc <= 0.5) %>%
+  mutate(lab="anc", result_value=0, uln=0.3) %>% select(!c(wbc, anc))
+
+dat_labs <- dat_labs_pre %>% filter(lab!="wbc") %>%  
+  distinct() %>% 
+  mutate(npx=(log2(result_value+1e-3)/uln)) %>%
+  group_by(lab) %>% mutate(npx=scale(npx)) %>% ungroup()
+
+# LUMINEX
+c1_lumin1a <- c1_luminex %>% filter(day_rel_car==0) %>%
+  filter(source!="csf") %>% select(!c(timepoint, source, day_rel_car)) %>% 
+  rename(tnf_a=tn_fa, ifn_g=if_ng) %>%
+  pivot_longer(!c(record_id), names_to="cytokine", values_to = "blval")
+
+c1_lumin2 <- c1_luminex %>% 
+  filter(source!="csf") %>% select(!c(timepoint, source)) %>% 
+  rename(tnf_a=tn_fa, ifn_g=if_ng) %>%
+  pivot_longer(!c(record_id, day_rel_car), names_to="cytokine", values_to = "value") %>% 
+  left_join(c1_lumin1a %>% select(record_id, cytokine, blval)) %>% drop_na(blval) %>% 
+  group_by(record_id, cytokine) %>% mutate(norm_value=log2(value/blval)) %>% ungroup() 
+
+c2_lumin1a <- c2_luminex %>% filter(day_rel_car==0) %>%
+  select(record_id, day_rel_car, cytokine, blval=value) 
+
+c2_lumin2 <- c2_luminex %>% 
+  left_join(c2_lumin1a %>% select(record_id, cytokine, blval)) %>% 
+  drop_na(blval) %>% select(!source) %>% 
+  group_by(record_id, cytokine) %>% mutate(norm_value=log2(value/blval)) %>% ungroup()  
+
+luminex <- bind_rows(c1_lumin2 %>% mutate(cohort="cohort1"), c2_lumin2 %>% mutate(cohort="cohort2"))
+luminexpanels <- unique(luminex$cytokine)
+
+luminex_interest <- luminexpanels
+
+
+dat_lumin <- luminex %>% 
+  mutate(
+    visit_f = factor(bin_visit(day_rel_car),
+               levels = c("Baseline", "W1", "W2", "W3", "W4"))
+  ) %>%
+  left_join(dat_pre, by="record_id") %>%
+  drop_na(trt_f) %>% 
+  left_join(df_nomissing %>% select(record_id, tt_crs_d, ev_crs)) %>%
+  mutate(crs=factor(case_when(
+    is.na(ev_crs)~NA,
+    ev_crs==1 & day_rel_car>=tt_crs_d~1,
+    .default=0
+  )
+  )) %>%
+  mutate(
+     crs_f = factor(
+      crs,
+      levels = c(0, 1),
+      labels = c("no_prior_crs", "prior_crs")
+    ),
+  day_rel_car=as.integer(day_rel_car)
+  ) %>%
+    select(!c(ev_crs, tt_crs_d, crs)) %>% 
+  rename(lab=cytokine, npx=norm_value)
+
+```
+
+## Linear mixed effects modeling to estimate treatment effect on laboratory measures post-infusion compared to baseline.
+
+Patient IDs included as random effects to account for repeated measures per patient. P-values and confidence intervals were derived using cluster-robust variance estimation (clubSandwich package) to account for within-match pair correlation. 
+
+### Figure S8 - bottom (paired boxplots of ALC changes)
+
+```{r, fig.width=8, fig.height=5, dpi=150}
+df_time=3
+bld = 0
+evt=c(3,5,7,10,14,28)
+
+cluster_var <- "subclass"
+covariates <- c("age_c", "sex_f", "costim_f", 'crs_f')
+model_vars <- c("npx", "trt_f", "day_rel_car", "record_id", cluster_var, covariates)
+fml <- as.formula(paste("npx ~", paste(
+    c(paste0("trt_f * splines::ns(day_rel_car, df = ", df_time, ")"), covariates  ,"(1 | record_id)"),
+    collapse = " + ")))
+ 
+dat1 <- dat_labs %>%
+    filter(day_rel_car >= -2 & day_rel_car <= 28) %>%  
+    filter(complete.cases(across(all_of(model_vars)))) %>%
+    droplevels() 
+labs <- sort(unique(dat1$lab))
+
+# evaluate CRP missigness and assessment patterns in both treatment and control cohorts
+dat1 %>% group_by(lab, visit_f, record_id, trt_f) %>% reframe(labs_per_pt=n()) %>% ungroup()  %>%
+  filter(lab=='crp') %>% 
+  ggplot(aes(x=visit_f, y=labs_per_pt)) +
+  ylab("CRP Measures Per Patient") + 
+  facet_wrap(trt_f~.) + 
+  geom_boxplot() + geom_jitter()
+
+# Prepare ALC data
+a <- dat1 %>% 
+  filter(lab=='alc') %>% 
+  filter(visit_f=="Baseline") %>%
+  group_by(record_id) %>% 
+  slice(which.max(day_rel_car)) %>% 
+  ungroup()  %>%
+  bind_rows(
+    dat1 %>% 
+  filter(lab=='alc') %>% 
+  filter(visit_f!="Baseline") %>%
+  group_by(record_id, visit_f) %>% 
+  slice(which.max(npx)) %>% 
+  ungroup()  
+  ) %>% 
+  filter(visit_f %in% c("Baseline", "W1", "W2", "W4")) %>% 
+  transmute(record_id, trt_f, visit_f, result_value=result_value, subclass) %>%
+  pivot_wider(names_from="visit_f", values_from = "result_value", values_fill = NA) %>%
+  mutate(diff=log2((W2 + 0.01)/(Baseline+0.01))) %>%
+  select(!c(Baseline, W1, W2, W4, record_id)) %>% 
+  pivot_wider(names_from = trt_f, values_from = diff, values_fill = NA) %>%
+  drop_na()
+
+print("t test for comparing Week 2 peak - Day 0 ALC fold change between treatment and matched control cohorts")
+t.test(a$control, a$anakinra, paired = T)
+pairdbox_alc <- ggpaired(data=a, cond1="control", cond2="anakinra") + stat_compare_means(paired = T)
+
+print(pairdbox_alc)
+ggsave(here(figures_dir, 'figs8a.pdf'), width = 8, height = 5)
+```
+
+### Figure S8 (top) - heatmap of laboratory trajectories
+Heatmap showing estimated treatment effects on longitudinal laboratory measures, expressed as log2 fold change differences from baseline (day 0) at post-CAR-T timepoints for ALC, platelet count, CRP, and ANC. 
+```{r, fig.width=8, fig.height=5, dpi=150}
+results_time_spline_labs <- run_labs(
+  data = dat1,
+  fit_fun = fit_cont_trt_lmm,
+  cluster_var = "subclass",
+  df_time = df_time,
+  eval_days = evt,
+  baseline_day=bld,
+  covars=covariates,
+  fml=fml
+) %>%
+  filter(grepl('DID:', contrast)) %>% 
+  mutate(
+    contrast = factor(
+      contrast,
+      levels=c(
+        paste('DID: day ', evt, ' vs day 0', sep='')
+      )
+    )
+  ) 
+selected_labs <- results_time_spline_labs %>%
+  group_by(lab) %>%
+  summarise(min_q = min(q, na.rm = TRUE), .groups = "drop") %>%
+  arrange(min_q) %>%
+  slice_head(n = 30) %>%
+  pull(lab)
+sfig10 <- results_time_spline_labs %>%
+  mutate(contrast=paste0("D", gsub("DID: d(.+)", "\\1", contrast))) %>% 
+  mutate(contrast = str_replace_all(contrast, "d", "D")) %>% 
+  mutate(contrast=factor(contrast, levels=c(
+    "Day 3 vs Day 0",
+    "Day 5 vs Day 0",
+    "Day 7 vs Day 0",
+    "Day 10 vs Day 0",
+    "Day 14 vs Day 0",
+    "Day 28 vs Day 0"
+  ))) %>%
+  filter(lab %in% selected_labs) %>% 
+  ggplot(aes(x = contrast, y = reorder(lab, estimate_log2), fill = estimate_log2)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(q < 0.05, "*", "")), size = 5) +
+  #geom_text(aes(label = ifelse(p < 0.05, "*", "")), size = 5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0)+
+  labs(
+    x = NULL,
+    y = "Laboratory Assay",
+    fill = "DID estimate\nNPX log2",
+    title = "Anakinra-associated longitudinal NPX changes",
+    subtitle = "* p < 0.05"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+print(sfig10)
+ggsave(here(figures_dir, 'figs8b.pdf'), width = 8, height = 5)
+
+```
+
+# Anakinra Prophylaxis correlates with a greater increase in IL1-a early post-infusion
+
+## Comparisons between Treatment and Control arms with Olink proteomics.
+
+This dataset is very sparse and imbalanced (only 9 patients with olink samples post-infusion in Cohort 1 control arm). Analyzed via linear mixed effects modeling.
+
+Only relative increases in IL1-alpha at days 3 and 5 are significant after adjustment for multiple hypotheses testing.
+
+## Figure S15
+```{r, fig.width=10, fig.height=15, dpi=150}
+df_time=3
+bld = -5
+evt=c(3,5,7, 10, 14, 28)
+
+cluster_var <- "subclass"
+covariates <- c("age_c", "sex_f", "costim_f", 'crs_f')
+model_vars <- c("npx", "trt_f", "day_rel_car", "record_id", cluster_var, covariates)
+fml <- as.formula(paste("npx ~", paste(
+    c(paste0("trt_f * splines::ns(day_rel_car, df = ", df_time, ")"), covariates, "(1 | record_id)"),
+    collapse = " + ")))
+
+dat1 <- dat_olink %>%
+    filter(complete.cases(across(all_of(model_vars)))) %>%
+    droplevels()
+labs <- sort(unique(dat1$lab))
+
+results_time_spline_olink <- run_labs(
+  data = dat1,
+  fit_fun = fit_cont_trt_lmm,
+  cluster_var = "subclass",
+  df_time = df_time,
+  eval_days = evt,
+  baseline_day=bld,
+  covars=covariates,
+  fml=fml
+) %>%
+  filter(grepl('DID:', contrast)) %>% 
+  mutate(
+    contrast = factor(
+      contrast,
+      levels=c(
+        paste('DID: day ', evt, ' vs day -5', sep='')
+      )
+    )
+  ) 
+selected_labs <- results_time_spline_olink %>%
+  group_by(lab) %>%
+  summarise(min_q = min(q, na.rm = TRUE), .groups = "drop") %>%
+  arrange(min_q) %>%
+  slice_head(n = 80) %>%
+  pull(lab)
+results_time_spline_olink %>%
+  mutate(contrast=paste0("D", gsub("DID: d(.+)", "\\1", contrast))) %>% 
+  mutate(contrast = str_replace_all(contrast, "d", "D")) %>% 
+  #filter(contrast!="Day 28 vs Day -5") %>%
+  mutate(contrast=factor(contrast, levels=c(
+    "Day 3 vs Day -5",
+    "Day 5 vs Day -5",
+    "Day 7 vs Day -5",
+    "Day 10 vs Day -5",
+    "Day 14 vs Day -5",
+    "Day 28 vs Day -5"
+  ))) %>%
+  filter(lab %in% selected_labs) %>% 
+  ggplot(aes(x = contrast, y = reorder(lab, estimate_log2), fill = estimate_log2)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(q < 0.10, "*", "")), size = 5) +
+  #geom_text(aes(label = ifelse(p < 0.05, "*", "")), size = 5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0)+
+  labs(
+    x = NULL,
+    y = "Cytokine",
+    fill = "DID estimate\nNPX log2",
+    title = "Anakinra-associated longitudinal NPX changes",
+    subtitle = "* p < 0.10 within contrast"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+ggsave(here(figures_dir, 'figs15.pdf'), width=10, height=15, dpi=150)
+```
+# Cohort 2 vs Cohort 1 differences
+
+## Figure 4C - Cumulative Anakinra Exposure across cohorts
+```{r, fig.width=5, fig.height=5, dpi=150}
+akra_cdose_plot <- df_csum %>% 
+  mutate(ac1=as.character(akra_cohort)) %>%
+  mutate(ac1 = ifelse(grepl('control', ac1), "control", ac1)) %>% 
+  ggplot(aes(x = day_rel_car, y = log10(cdose+1), group = record_id, color = ac1)) +
+  xlim(-2, 14) +
+  geom_step(alpha = 0.1, linewidth = 0.5) +            # individual subjects
+  stat_summary(aes(group = ac1), fun = median,
+               geom = "line", linewidth = 1.2) +        # arm median
+  labs(title = "Cumulative anakinra exposure by arm",
+       x = "Days from Infusion", y = "Log10 Cumulative dose", color = "Arm") +
+  theme_minimal() + 
+  scale_color_manual(values=c("#1F5AA6", "#087F8C", 'darkred'))
+
+print(akra_cdose_plot)
+ggsave(here(figures_dir, 'fig4c.pdf'), width=5, height=5, dpi=150)
+  
+
+```
+
+## Figure 4D - Cytokine trajectory differences between Cohort 2 and 1
+
+```{r, fig.width=15, fig.height=5, dpi=150}
+df_time=3
+bld = 0
+evt=c(3,5,7,10,14)
+
+cohort_var = "akra_cohort_f"
+covariates <- c("age_c", "sex_f", "costim_f", "crs_f")
+model_vars <- c("npx", cohort_var, "day_rel_car", "record_id", covariates)
+fml <- as.formula(paste("npx ~", paste(c(paste0(cohort_var, " * splines::ns(day_rel_car, df = ", df_time, ")"),covariates,"(1 | record_id)"),collapse = " + ")))
+
+dat1 <- dat_lumin %>%
+    filter(akra_cohort_f %in% c("cohort1", "cohort2")) %>% 
+    filter(complete.cases(across(all_of(model_vars)))) %>%
+    droplevels()
+
+missing_labs <- as.character(((dat1 %>% select(lab, cohort_var) %>% table() %>% as.data.frame() %>% filter(Freq==0)) %>% select(lab) %>% distinct() %>% droplevels())$lab)
+
+dat1 <- dat1 %>% filter(!(lab %in% missing_labs))
+
+results_cont_cohort <- run_labs(
+  data = dat1,
+  fit_fun = fit_cont_cohort_lmm,
+  df_time = df_time,
+  eval_days = evt,
+  baseline_day=bld,
+  covars=covariates,
+  fml=fml,
+  cohort_var=cohort_var
+) %>% 
+  filter(grepl('DID:', contrast)) %>% 
+  mutate(
+    contrast = factor(
+      contrast, 
+      levels=c(
+        paste('Cohort2 vs cohort1 DID: day ', evt, ' vs day 0', sep='')
+      )
+    )
+  ) 
+selected_labs <- results_cont_cohort %>%
+  group_by(lab) %>%
+  summarise(min_q = min(q, na.rm = TRUE), .groups = "drop") %>%
+  arrange(min_q) %>%
+  slice_head(n = 50) %>%
+  pull(lab)
+fig4e <- results_cont_cohort %>%
+    mutate(contrast=paste0("D", gsub("Cohort2 vs cohort1 DID: d(.+)", "\\1", contrast))) %>% 
+  mutate(contrast = str_replace_all(contrast, "d", "D")) %>% 
+  mutate(contrast=factor(contrast, levels=rev(c(
+    "Day 3 vs Day 0",
+    "Day 5 vs Day 0",
+    "Day 7 vs Day 0",
+    "Day 10 vs Day 0",
+    "Day 14 vs Day 0"
+  )))) %>%
+  filter(lab %in% selected_labs) %>% 
+  ggplot(aes(x = reorder(lab, estimate_log2), y = contrast, fill = estimate_log2)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(q < 0.05, "*", "")), size = 5) +
+  #geom_text(aes(label = ifelse(p < 0.05, "*", "")), size = 5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0)+
+  labs(
+    x = "Protein",
+    y = NULL,
+    fill = "DID estimate\nNPX log2",
+    title = "Anakinra-associated longitudinal NPX changes",
+    subtitle = "* q < 0.05 within contrast"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text=element_text(family="Arial")
+  ) 
+
+print(fig4e)
+library(extrafont)
+ggsave(here(figures_dir, 'fig4d.pdf'), plot=fig4e,  width=15, height=5, dpi=150)
+```
+
+# Figure S16 - visualize differences in IL1-Ra trajectories between cohorts 1 and 2. 
+
+```{r, fig.width=5, fig.height=5, dpi=150}
+ilra <- dat_lumin %>%
+  filter(lab=="il_1ra") %>%
+  ggplot(aes(x=day_rel_car, y=log10(value+1e-2), color=akra_cohort_f, fill=akra_cohort_f)) + 
+  xlim(-5, 14) +
+  geom_smooth(alpha=0.2) + geom_point() + 
+  theme_minimal() +
+  scale_color_manual(values=c("#1F5AA6", "#087F8C")) +
+  scale_fill_manual(values=c("#1F5AA6", "#087F8C")) + 
+  xlab("Day Relative to CAR-T Infusion") + 
+  ylab("")
+
+print(ilra)
+ggsave(here(figures_dir, 'figs16.pdf'), plot=ilra,  width=5, height=5, dpi=150)
+```
+
+# Linear Mixed Effects Modeling - Effect Size estimation. Methods validation
+
+Code to derive p-values and confidence estimates from linear mixed model objects uses a lot of wrapper and helper functions. To make the analysis more interpretable and facilitate validation/peer-review. I will validate and reproduce key findings using a more direct alternative script.
+
+### Evaluate treatment effect on ALC change at day 7 compared to day 0 using results above.
+
+```{r}
+
+fig_res <- results_time_spline_labs %>% 
+  filter(contrast_class=="did_vs_baseline" & day_rel_car==7) %>%
+  filter(lab=='alc')
+
+cat(paste0('\nThe estimated log2 fold change over cohort 1 at Day 7 is ', fig_res$estimate_log2, " and the p-value is ", fig_res$p, '\n'))
+
+```
+
+And now we will try to replicate the finding with a simpler script. First to get the estimated effect size with p-value and confidence estimated without clubSandwich.
+
+```{r, echo=TRUE}
+df_time=3
+bld = 0
+evt=c(3,5,7,10,14,28)
+
+cluster_var <- "subclass"
+covariates <- c("age_c", "sex_f", "costim_f", 'crs_f')
+model_vars <- c("npx", "trt_f", "day_rel_car", "record_id", cluster_var, covariates)
+fml <- as.formula(paste("npx ~", paste(
+    c(paste0("trt_f * splines::ns(day_rel_car, df = ", df_time, ")"), covariates  ,"(1 | record_id)"),
+    collapse = " + ")))
+ 
+dat_lab <- dat_labs %>%
+    filter(day_rel_car >= -2 & day_rel_car <= 28) %>%  
+    filter(complete.cases(across(all_of(model_vars)))) %>%
+    droplevels() %>% filter(lab=='alc')
+
+fit <-  lme4::lmer(
+    fml,
+    data = dat_lab,
+    REML = FALSE
+  )
+
+library(lme4)
+b <- fixef(fit)
+
+knots_info <- with(dat_lab, splines::ns(day_rel_car, df = 3))
+B <- splines::ns(c(0, 7), df = 3,
+                 knots = attr(knots_info, "knots"),
+                 Boundary.knots = attr(knots_info, "Boundary.knots"))
+
+bs0 <- B[1, ]  
+bs7 <- B[2, ]  
+
+idx_int <- grep("^trt_fanakinra:splines", names(b))
+b_int <- b[idx_int]
+
+idx_sp <- grep("^splines::ns", names(b))
+b_sp <- b[idx_sp]
+
+did <- sum((bs7 - bs0) * b_int)
+
+V <- vcov(fit)
+
+L_did <- numeric(length(b))
+names(L_did) <- names(b)
+L_did[idx_int] <- bs7 - bs0
+
+se_did <- sqrt(as.numeric(t(L_did) %*% V %*% L_did))
+
+cat("Difference-in-differences (day7 vs day0):\n")
+cat(sprintf("  Estimate: %.4f, SE: %.4f, z: %.3f, p: %.4f\n",
+            did, se_did, did / se_did, 2 * pnorm(-abs(did / se_did))))
+
+```
+
+And now will account for correlation within match pairs.
+
+```{r, echo=TRUE}
+library(clubSandwich)
+
+V_cr2 <- clubSandwich::vcovCR(fit, cluster = dat_lab$subclass, type = "CR2")
+se_did_robust  <- sqrt(as.numeric(t(L_did)  %*% V_cr2 %*% L_did))
+
+result_did  <- clubSandwich::Wald_test(fit, constraints = matrix(L_did, nrow = 1),
+                         vcov = V_cr2, test = "HTZ")
+cat(paste0("P value after accounting for within match-pair correlation: ", result_did$p_val))
+```
+
+The two sets of values are very similar.
